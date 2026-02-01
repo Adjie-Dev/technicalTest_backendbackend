@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual env
+venv/
+.env
+.env.*
+!.env.example
+pyvenv.cfg
+
+# Logs
+*.log
+*.pid
+*.seed
+*.sqlite3
+
+# VS Code
+.vscode/
+.history/
+
+# OS
+.DS_Store
+Thumbs.db
