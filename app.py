@@ -1,7 +1,15 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 from dotenv import load_dotenv
 import os
+import sys
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
+
+# Clear import cache for image_moderation (temporary fix)
+if 'services.image_moderation' in sys.modules:
+    del sys.modules['services.image_moderation']
 
 from services.text_moderation import TextModerationService
 from services.image_moderation import ImageModerationService
@@ -33,6 +41,13 @@ POLICY_SETTINGS = {
     'auto_reject_threshold': 0.7
 }
 
+# Mapping decision dari image_moderation.py ke format apply_policy
+IMAGE_DECISION_MAP = {
+    'DITOLAK': 'auto_reject',
+    'PERLU_DITINJAU': 'review_required',
+    'AMAN': 'auto_approve'
+}
+
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
@@ -40,6 +55,105 @@ def health_check():
         'status': 'healthy',
         'message': 'Content Moderation API is running'
     })
+
+# ============================================================================
+# IMAGE PROXY ENDPOINTS - BYPASS CORS
+# ============================================================================
+
+@app.route('/proxy/image', methods=['GET'])
+def proxy_image():
+    """
+    Proxy endpoint untuk fetch image dari URL external
+    Usage: /proxy/image?url=https://example.com/image.jpg
+    """
+    try:
+        image_url = request.args.get('url')
+        
+        if not image_url:
+            return jsonify({'error': 'URL parameter required'}), 400
+        
+        if not (image_url.startswith('http://') or image_url.startswith('https://')):
+            return jsonify({'error': 'Invalid URL'}), 400
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        
+        response = requests.get(image_url, headers=headers, timeout=10)
+        response.raise_for_status()
+        
+        content_type = response.headers.get('Content-Type', 'image/jpeg')
+        
+        return Response(
+            response.content,
+            mimetype=content_type,
+            headers={
+                'Access-Control-Allow-Origin': '*',
+                'Cache-Control': 'public, max-age=3600'
+            }
+        )
+        
+    except requests.exceptions.RequestException as e:
+        return jsonify({'error': f'Failed to fetch image: {str(e)}'}), 500
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/proxy/extract-image', methods=['GET'])
+def proxy_extract_image():
+    """
+    Extract image dari HTML page lalu proxy
+    Usage: /proxy/extract-image?url=https://example.com/page
+    """
+    try:
+        page_url = request.args.get('url')
+        
+        if not page_url:
+            return jsonify({'error': 'URL parameter required'}), 400
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        
+        response = requests.get(page_url, headers=headers, timeout=10)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        # Try og:image meta tag first
+        og_image = soup.find('meta', property='og:image')
+        if og_image and og_image.get('content'):
+            image_url = urljoin(page_url, og_image['content'])
+        else:
+            # Try first large image
+            img_tag = soup.find('img')
+            if img_tag and img_tag.get('src'):
+                image_url = urljoin(page_url, img_tag['src'])
+            else:
+                return jsonify({'error': 'No image found in page'}), 404
+        
+        # Fetch extracted image
+        img_response = requests.get(image_url, headers=headers, timeout=10)
+        img_response.raise_for_status()
+        
+        content_type = img_response.headers.get('Content-Type', 'image/jpeg')
+        
+        return Response(
+            img_response.content,
+            mimetype=content_type,
+            headers={
+                'Access-Control-Allow-Origin': '*',
+                'Cache-Control': 'public, max-age=3600',
+                'X-Original-URL': image_url
+            }
+        )
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ============================================================================
+# MODERATION ENDPOINTS
+# ============================================================================
 
 @app.route('/api/moderate/text', methods=['POST'])
 def moderate_text():
@@ -60,13 +174,9 @@ def moderate_text():
         if not text:
             return jsonify({'error': 'Text is required'}), 400
         
-        # FIX: Panggil .to_dict() untuk convert ke dictionary
         result_obj = text_service.moderate(text, lang=lang)
         result = result_obj.to_dict()
         
-        # FIX: Jangan override decision jika sudah ada dari service
-        # TextModerationService sudah return decision yang benar
-        # apply_policy() hanya untuk fallback atau validasi tambahan
         if result.get('decision') not in ['auto_approve', 'auto_reject', 'review_required']:
             decision = apply_policy(result)
             result['decision'] = decision
@@ -95,13 +205,17 @@ def moderate_image():
         if not image:
             return jsonify({'error': 'Image is required'}), 400
         
-        # FIX: Panggil .to_dict() jika image_service juga return object
         result_obj = image_service.moderate(image, image_type)
         result = result_obj.to_dict() if hasattr(result_obj, 'to_dict') else result_obj
-        
-        # Apply policy
-        decision = apply_policy(result)
-        result['decision'] = decision
+
+        # FIX: image_moderation.py sudah return decision yang benar (DITOLAK / PERLU_DITINJAU / AMAN)
+        # Map ke format policy dan jangan overwrite dengan apply_policy()
+        raw_decision = result.get('decision')
+        if raw_decision in IMAGE_DECISION_MAP:
+            result['decision'] = IMAGE_DECISION_MAP[raw_decision]
+        else:
+            # Fallback ke apply_policy kalau decision nggak dikenal
+            result['decision'] = apply_policy(result)
         
         return jsonify(result)
         
@@ -125,11 +239,9 @@ def moderate_video():
         if not video_url:
             return jsonify({'error': 'Video URL is required'}), 400
         
-        # FIX: Panggil .to_dict() jika video_service juga return object
         result_obj = video_service.moderate(video_url)
         result = result_obj.to_dict() if hasattr(result_obj, 'to_dict') else result_obj
         
-        # Apply policy
         decision = apply_policy(result)
         result['decision'] = decision
         
@@ -155,11 +267,9 @@ def moderate_audio():
         if not audio_url:
             return jsonify({'error': 'Audio URL is required'}), 400
         
-        # FIX: Panggil .to_dict() jika audio_service juga return object
         result_obj = audio_service.moderate(audio_url)
         result = result_obj.to_dict() if hasattr(result_obj, 'to_dict') else result_obj
         
-        # Apply policy
         decision = apply_policy(result)
         result['decision'] = decision
         
@@ -201,19 +311,30 @@ def apply_policy(result):
     if not result.get('flagged'):
         return 'auto_approve'
     
-    # Get highest score from all categories
     scores = result.get('scores', {})
     if scores:
-        max_score = max(scores.values())
-        
-        if max_score >= POLICY_SETTINGS['auto_reject_threshold']:
-            return 'auto_reject'
-        elif max_score <= POLICY_SETTINGS['auto_approve_threshold']:
-            return 'auto_approve'
-        else:
-            return 'review_required'
+        # FIX: filter cuma ambil value yang float/int
+        # scores bisa mengandung dict seperti scores['nudity'] dan scores['weapon_classes']
+        numeric_scores = [v for v in scores.values() if isinstance(v, (int, float))]
+
+        # kalau scores['nudity'] ada (dict), ambil sub-scores-nya juga
+        if 'nudity' in scores and isinstance(scores['nudity'], dict):
+            numeric_scores.extend(scores['nudity'].values())
+
+        # kalau scores['weapon_classes'] ada (dict), ambil sub-scores-nya juga
+        if 'weapon_classes' in scores and isinstance(scores['weapon_classes'], dict):
+            numeric_scores.extend(scores['weapon_classes'].values())
+
+        if numeric_scores:
+            max_score = max(numeric_scores)
+
+            if max_score >= POLICY_SETTINGS['auto_reject_threshold']:
+                return 'auto_reject'
+            elif max_score <= POLICY_SETTINGS['auto_approve_threshold']:
+                return 'auto_approve'
+            else:
+                return 'review_required'
     
-    # If flagged but no scores (rule-based only)
     return 'review_required'
 
 @app.route('/api/stats', methods=['GET'])
@@ -227,9 +348,16 @@ def get_stats():
     })
 
 if __name__ == '__main__':
-    # Check if API credentials are set
     if not os.getenv('SIGHTENGINE_API_USER') or not os.getenv('SIGHTENGINE_API_SECRET'):
         print("WARNING: Sightengine API credentials not set!")
         print("Please create .env file with SIGHTENGINE_API_USER and SIGHTENGINE_API_SECRET")
+    
+    print("=" * 60)
+    print("CONTENT MODERATION API + IMAGE PROXY")
+    print("=" * 60)
+    print("Image Proxy Endpoints:")
+    print("  GET /proxy/image?url=<URL>")
+    print("  GET /proxy/extract-image?url=<URL>")
+    print("=" * 60)
     
     app.run(debug=True, host='0.0.0.0', port=5000)
