@@ -28,7 +28,14 @@ CORS(app)
 text_service = TextModerationService()
 image_service = ImageModerationService()
 video_service = VideoModerationService()
-audio_service = AudioModerationService()
+
+# Initialize audio service dengan error handling
+try:
+    audio_service = AudioModerationService()
+    print("[INFO] AudioModerationService initialized successfully")
+except Exception as e:
+    print(f"[ERROR] Failed to initialize AudioModerationService: {str(e)}")
+    audio_service = None
 
 # Policy settings (threshold defaults)
 POLICY_SETTINGS = {
@@ -47,6 +54,13 @@ IMAGE_DECISION_MAP = {
     'PERLU_DITINJAU': 'review_required',
     'AMAN': 'auto_approve'
 }
+
+# File type yang diizinkan untuk audio upload
+ALLOWED_AUDIO_EXTENSIONS = {'mp3', 'wav', 'm4a', 'ogg', 'flac', 'mp4', 'webm', 'wma', 'aac'}
+MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50MB
+
+def allowed_audio_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_AUDIO_EXTENSIONS
 
 @app.route('/health', methods=['GET'])
 def health_check():
@@ -253,30 +267,189 @@ def moderate_video():
 @app.route('/api/moderate/audio', methods=['POST'])
 def moderate_audio():
     """
-    Audio moderation endpoint
+    Audio moderation endpoint (URL mode)
     
     Body:
     {
-        "url": "Audio/Video URL"
+        "audio_url": "Audio/Video URL",
+        "language": "id" or "en" (optional, default: id)
     }
     """
     try:
+        print("\n" + "="*60)
+        print("[AUDIO MODERATION] Request received")
+        print("="*60)
+        
+        # Cek service initialized
+        if audio_service is None:
+            print("[ERROR] Audio service not initialized")
+            return jsonify({
+                'status': 'error',
+                'message': 'Audio service not initialized. Check ASSEMBLYAI_API_KEY in .env file'
+            }), 500
+        
+        # Get request data
         data = request.get_json()
-        audio_url = data.get('url')
+        print(f"[DEBUG] Request data: {data}")
         
-        if not audio_url:
-            return jsonify({'error': 'Audio URL is required'}), 400
+        # Validasi
+        if not data:
+            print("[ERROR] No JSON data in request")
+            return jsonify({
+                'status': 'error',
+                'message': 'No JSON data provided'
+            }), 400
         
-        result_obj = audio_service.moderate(audio_url)
-        result = result_obj.to_dict() if hasattr(result_obj, 'to_dict') else result_obj
+        # Validasi ketat: harus string dan non-empty
+        audio_url = data.get('audio_url') or data.get('url')
+
+        if not audio_url or not isinstance(audio_url, str):
+            print(f"[ERROR] Invalid audio_url: {repr(audio_url)} (type: {type(audio_url).__name__})")
+            return jsonify({
+                'status': 'error',
+                'message': 'audio_url is required and must be a valid URL string',
+                'hint': 'Kirim body seperti: {"audio_url": "https://example.com/audio.mp3"}',
+                'received': {
+                    'value': repr(audio_url),
+                    'type': type(audio_url).__name__
+                }
+            }), 400
         
-        decision = apply_policy(result)
-        result['decision'] = decision
+        language = data.get('language', 'id')
         
-        return jsonify(result)
+        print(f"[INFO] Processing audio_url: {audio_url}")
+        print(f"[INFO] Language: {language}")
+        
+        # Call audio moderation service
+        result = audio_service.moderate(audio_url, language=language)
+        
+        print(f"[INFO] Moderation result status: {result.get('status')}")
+        
+        # Handle error result
+        if result.get('status') == 'error':
+            print(f"[ERROR] Moderation failed: {result.get('message')}")
+            return jsonify(result), 500
+        
+        # Apply policy jika perlu
+        if 'decision' not in result:
+            decision = apply_policy(result)
+            result['decision'] = decision
+        
+        print(f"[SUCCESS] Moderation completed. Flagged: {result.get('flagged')}")
+        print("="*60 + "\n")
+        
+        return jsonify(result), 200
         
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        print(f"[EXCEPTION] Unexpected error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'status': 'error',
+            'message': f'Internal server error: {str(e)}'
+        }), 500
+
+
+@app.route('/api/moderate/audio/file', methods=['POST'])
+def moderate_audio_file():
+    """
+    Audio moderation endpoint (file upload mode)
+    
+    Form data:
+        audio: file upload
+        language: "id" or "en" (optional, default: id)
+    
+    Flow:
+        1. Terima file dari frontend
+        2. Upload file ke AssemblyAI via /v2/upload
+        3. Dapat upload_url dari AssemblyAI
+        4. Kirim upload_url ke moderate() untuk transcribe + moderation
+    """
+    try:
+        print("\n" + "="*60)
+        print("[AUDIO MODERATION - FILE UPLOAD] Request received")
+        print("="*60)
+
+        if audio_service is None:
+            return jsonify({
+                'status': 'error',
+                'message': 'Audio service not initialized. Check ASSEMBLYAI_API_KEY in .env file'
+            }), 500
+
+        # Cek file ada di request
+        if 'audio' not in request.files:
+            print("[ERROR] No 'audio' file in request")
+            return jsonify({
+                'status': 'error',
+                'message': "File 'audio' tidak ditemukan dalam request"
+            }), 400
+
+        audio_file = request.files['audio']
+
+        # Validasi filename
+        if audio_file.filename == '':
+            return jsonify({
+                'status': 'error',
+                'message': 'File kosong, pilih file audio yang valid'
+            }), 400
+
+        # Validasi extension
+        if not allowed_audio_file(audio_file.filename):
+            return jsonify({
+                'status': 'error',
+                'message': f'Format file tidak didukung. Gunakan: {", ".join(ALLOWED_AUDIO_EXTENSIONS)}'
+            }), 400
+
+        # Validasi size
+        audio_file.seek(0, 2)  # Seek ke end
+        file_size = audio_file.tell()
+        audio_file.seek(0)     # Reset ke beginning
+
+        if file_size > MAX_UPLOAD_SIZE:
+            return jsonify({
+                'status': 'error',
+                'message': f'File terlalu besar. Maksimum 50MB, file Anda: {file_size / (1024*1024):.1f}MB'
+            }), 400
+
+        print(f"[INFO] File: {audio_file.filename}, Size: {file_size / 1024:.1f}KB")
+
+        # Baca file bytes
+        file_bytes = audio_file.read()
+
+        # Step 1: Upload ke AssemblyAI
+        print("[INFO] Uploading to AssemblyAI...")
+        upload_url = audio_service.upload_audio(file_bytes)
+        print(f"[INFO] AssemblyAI upload_url: {upload_url}")
+
+        # Step 2: Moderate pake upload_url
+        language = request.form.get('language', 'id')
+        print(f"[INFO] Starting moderation with language: {language}")
+
+        result = audio_service.moderate(upload_url, language=language)
+
+        if result.get('status') == 'error':
+            print(f"[ERROR] Moderation failed: {result.get('message')}")
+            return jsonify(result), 500
+
+        # Apply policy
+        if 'decision' not in result:
+            decision = apply_policy(result)
+            result['decision'] = decision
+
+        print(f"[SUCCESS] File moderation completed. Flagged: {result.get('flagged')}")
+        print("="*60 + "\n")
+
+        return jsonify(result), 200
+
+    except Exception as e:
+        print(f"[EXCEPTION] Unexpected error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'status': 'error',
+            'message': f'Internal server error: {str(e)}'
+        }), 500
+
 
 @app.route('/api/policy/settings', methods=['GET', 'POST'])
 def policy_settings():
@@ -348,6 +521,14 @@ def get_stats():
     })
 
 if __name__ == '__main__':
+    # Cek environment variables
+    if not os.getenv('ASSEMBLYAI_API_KEY'):
+        print("\n" + "!"*60)
+        print("WARNING: ASSEMBLYAI_API_KEY not set in .env file!")
+        print("Audio moderation will not work without this API key")
+        print("Get your free API key at: https://www.assemblyai.com/")
+        print("!"*60 + "\n")
+    
     if not os.getenv('SIGHTENGINE_API_USER') or not os.getenv('SIGHTENGINE_API_SECRET'):
         print("WARNING: Sightengine API credentials not set!")
         print("Please create .env file with SIGHTENGINE_API_USER and SIGHTENGINE_API_SECRET")
@@ -358,6 +539,9 @@ if __name__ == '__main__':
     print("Image Proxy Endpoints:")
     print("  GET /proxy/image?url=<URL>")
     print("  GET /proxy/extract-image?url=<URL>")
+    print("Audio Endpoints:")
+    print("  POST /api/moderate/audio          <- URL mode")
+    print("  POST /api/moderate/audio/file     <- File upload mode")
     print("=" * 60)
     
     app.run(debug=True, host='0.0.0.0', port=5000)
